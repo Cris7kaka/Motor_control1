@@ -46,6 +46,7 @@ extern "C" {
 #define CURRENT_GAIN    10.0f   //!< 电流采样增益 (根据硬件修改)
 #define CURRENT_OFFSET  1.65f   //!< 电流采样偏置电压 [V]
 #define PWM_FREQUENCY   20000.0f//!< PWM开关频率 [Hz] (20kHz)
+#define PWM_TIMER_PERIOD 2100.0f//!< PWM定时器周期 (假设使用2100作为ARR值，基于84MHz时钟，预分频为0)
 
 #define Ts              0.001f  //!< 控制周期 [s] (控制频率的倒数，1kHz控制频率)
 
@@ -118,7 +119,6 @@ typedef struct {
  */
 typedef struct {
     // 电机参数
-    uint8_t motor_id;               //!< 电机ID
     int pole_pairs;                 //!< 极对数
     float phase_resistance;         //!< 相电阻
     float phase_inductance;         //!< 相电感
@@ -152,57 +152,51 @@ typedef struct {
     LowPassFilter_t lpf_current_d;  //!< d轴电流滤波器
     LowPassFilter_t lpf_velocity;   //!< 速度滤波器 (保留兼容性)
     
-    // SVPWM输出
-    float pwm_a;                    //!< A相PWM占空比
-    float pwm_b;                    //!< B相PWM占空比
-    float pwm_c;                    //!< C相PWM占空比
-    
-    // 控制模式 (保留字段但不再使用枚举)
-    uint8_t control_mode;           //!< 控制模式 (硬编码为IF模式)
-    
-    // 使能标志
-    bool enabled;                   //!< 控制器使能标志
+    // SVPWM输出 (定时器比较寄存器的值)
+    float pwm_a;                    //!< A相PWM比较寄存器值
+    float pwm_b;                    //!< B相PWM比较寄存器值
+    float pwm_c;                    //!< C相PWM比较寄存器值
     
     // IF模式专用
     float if_current_amplitude;     //!< IF模式电流幅值
-    float vf_voltage_amplitude;     //!< VF模式电压幅值 (保留兼容性)
     float openloop_angle;           //!< 开环角度累加
     float openloop_velocity;        //!< 开环速度
     
 } FOC_Controller_t;
 
+/* ==================== 全局变量声明 ==================== */
+
+/**
+ * @brief 全局目标电流和速度变量，用于调试时直接修改
+ */
+extern float g_target_current_q;      //!< 全局目标q轴电流 [A]
+extern float g_target_current_d;      //!< 全局目标d轴电流 [A]
+extern float g_target_velocity_rpm;   //!< 全局目标速度 [RPM]
+
 /* ==================== 函数声明 ==================== */
 
 /**
  * @brief 初始化FOC控制器
- * @param motor_id 电机ID
  * @return 初始化后的FOC控制器结构体
  */
-FOC_Controller_t FOC_Init(uint8_t motor_id);
+FOC_Controller_t FOC_Init(void);
 
 /**
- * @brief 执行IF模式控制
+ * @brief 设置全局目标参数
+ * @param target_current_q q轴目标电流 [A]
+ * @param target_current_d d轴目标电流 [A]
+ * @param target_velocity_rpm 目标速度 [RPM]
  */
-void FOC_Run(void);
-
-/**
- * @brief 设置IF模式参数
- * @param current_amplitude 电流幅值 [A]
- * @param frequency 频率 [Hz]
- */
-void FOC_SetIFModeParams(float current_amplitude, float frequency);
+void FOC_SetGlobalTargetParams(float target_current_q, float target_current_d, float target_velocity_rpm);
 
 /**
  * @brief IF模式控制 (电流-频率开环)
- * @param controller FOC控制器结构体
- * @param current_amplitude 电流幅值 [A]
- * @param frequency 频率 [Hz]
- * @param dt 时间间隔 [s]
- * @return 更新后的FOC控制器结构体
  * @details 通过控制电流幅值和频率来驱动电机，无需位置传感器
  *          使用反馈电流构成电流闭环，角度开环
+ *          使用全局定义的 Ts 作为控制周期
+ *          直接操作全局变量，无返回值
  */
-FOC_Controller_t IF_Mode_Control(FOC_Controller_t controller, float current_amplitude, float frequency, float dt);
+void IF_Mode_Control(void);
 
 /**
  * @brief 归一化角度到[0, 2π]
