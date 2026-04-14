@@ -1,9 +1,9 @@
 /**
  * @file STM32F4_FOC_Control.c
  * @brief STM32F446 FOC电机控制算法实现
- * @details 实现电流环、速度环、IF模式、VF模式控制，支持SVPWM零序注入
- * @version 1.0
- * @date 2026-04-08
+ * @details 仅实现IF模式控制
+ * @version 3.0
+ * @date 2026-04-14
  * 
  * 硬件平台: STM32F446
  * 电机ID: 0
@@ -11,9 +11,13 @@
 
 #include "STM32F4_FOC_Control.h"
 #include <string.h>
+#include <math.h>  // 添加math.h以使用sin和cos函数
 
 /* ==================== 全局变量 ==================== */
-static FOC_Controller_t foc_controllers[1]; //!< 控制器实例数组 (仅支持motor_id=0)
+static FOC_Controller_t g_foc_controller; //!< 全局控制器实例 (仅支持motor_id=0)
+
+/* ==================== 宏定义 ==================== */
+#define FOC_MODE_IF 2  //!< IF模式 (电流-频率开环)
 
 /* ==================== 辅助函数实现 ==================== */
 
@@ -28,36 +32,7 @@ float Normalize_Angle(float angle) {
     return angle;
 }
 
-/**
- * @brief 快速正弦近似计算 (使用查找表或泰勒展开)
- */
-float Fast_Sin(float angle) {
-    // 归一化角度到[-π, π]
-    angle = Normalize_Angle(angle + PI) - PI;
-    
-    // 使用泰勒级数展开 (精度足够FOC控制)
-    float angle_sq = angle * angle;
-    float result = angle * (1.0f - angle_sq / 6.0f * (1.0f - angle_sq / 20.0f * (1.0f - angle_sq / 42.0f)));
-    
-    return result;
-}
-
-/**
- * @brief 快速余弦近似计算
- */
-float Fast_Cos(float angle) {
-    return Fast_Sin(angle + PI_2);
-}
-
-/**
- * @brief 同时计算正弦和余弦
- */
-void Fast_SinCos(float angle, float* sin_val, float* cos_val) {
-    *sin_val = Fast_Sin(angle);
-    *cos_val = Fast_Cos(angle);
-}
-
-/* ==================== PID控制器实现 (PI控制, 无微分) ==================== */
+/* ==================== PID控制器实现 (PI控制) ==================== */
 
 /**
  * @brief 初始化PID控制器 (PI控制)
@@ -68,13 +43,12 @@ PID_Controller_t PID_Init(PID_Controller_t pid, float kp, float ki, float limit)
     pid.integral = 0.0f;
     pid.prev_error = 0.0f;
     pid.output_limit = limit;
-    pid.ramp_rate = 0.0f;  // 默认不限制斜率
     pid.prev_output = 0.0f;
     return pid;
 }
 
 /**
- * @brief PI控制器计算 (无微分项)
+ * @brief PI控制器计算
  * @param pid PI控制器结构体
  * @param error 误差值
  * @param dt 时间间隔 [s]
@@ -95,7 +69,7 @@ PID_Compute_Result_t PID_Compute(PID_Controller_t pid, float error, float dt) {
     // 积分项 (带抗饱和)
     pid.integral += pid.ki * error * dt;
     
-    // 计算输出 (无微分项)
+    // 计算输出
     float output = proportional + pid.integral;
     
     // 抗饱和处理 (clamping)
@@ -106,17 +80,6 @@ PID_Compute_Result_t PID_Compute(PID_Controller_t pid, float error, float dt) {
     } else if (output < -pid.output_limit) {
         output = -pid.output_limit;
         pid.integral -= pid.ki * error * dt;
-    }
-    
-    // 斜率限制
-    if (pid.ramp_rate > 0.0f) {
-        float max_change = pid.ramp_rate * dt;
-        float diff = output - pid.prev_output;
-        if (diff > max_change) {
-            output = pid.prev_output + max_change;
-        } else if (diff < -max_change) {
-            output = pid.prev_output - max_change;
-        }
     }
     
     // 更新状态
@@ -198,9 +161,8 @@ AlphaBeta_t Clarke_Transform(Phase_t abc) {
  */
 DQ_t Park_Transform(AlphaBeta_t ab, float angle_el) {
     DQ_t dq;
-    float sin_angle, cos_angle;
-    
-    Fast_SinCos(angle_el, &sin_angle, &cos_angle);
+    float sin_angle = sinf(angle_el);
+    float cos_angle = cosf(angle_el);
     
     // Park变换公式
     dq.d = cos_angle * ab.alpha + sin_angle * ab.beta;
@@ -214,9 +176,8 @@ DQ_t Park_Transform(AlphaBeta_t ab, float angle_el) {
  */
 AlphaBeta_t Inverse_Park_Transform(DQ_t dq, float angle_el) {
     AlphaBeta_t ab;
-    float sin_angle, cos_angle;
-    
-    Fast_SinCos(angle_el, &sin_angle, &cos_angle);
+    float sin_angle = sinf(angle_el);
+    float cos_angle = cosf(angle_el);
     
     // 逆Park变换公式
     ab.alpha = cos_angle * dq.d - sin_angle * dq.q;
@@ -315,111 +276,12 @@ FOC_Controller_t Read_Phase_Currents(FOC_Controller_t controller) {
     return controller;
 }
 
-/* ==================== 电流环FOC控制 (id=0策略) ==================== */
-
-/**
- * @brief 电流环FOC控制 (id=0策略)
- * @details 实现完整的FOC电流环控制，包括:
- *          1. 三相电流采样
- *          2. Clarke变换
- *          3. Park变换
- *          4. dq轴电流PI控制
- *          5. 逆Park变换
- *          6. SVPWM调制 (零序注入)
- */
-FOC_Controller_t Current_Loop_FOC(FOC_Controller_t controller, float iq_ref, float dt) {
-    if (!controller.enabled) {
-        return controller;
-    }
-    
-    // 1. 读取三相电流
-    controller = Read_Phase_Currents(controller);
-    
-    // 2. Clarke变换 (abc -> αβ)
-    controller.alpha_beta_current = Clarke_Transform(controller.phase_currents);
-    
-    // 3. Park变换 (αβ -> dq)
-    controller.dq_current = Park_Transform(controller.alpha_beta_current, controller.electrical_angle);
-    
-    // 4. 低通滤波
-    LPF_Result_t lpf_result_d = LPF_Compute(controller.lpf_current_d, controller.dq_current.d, dt);
-    controller.dq_current.d = lpf_result_d.output;
-    controller.lpf_current_d = lpf_result_d.lpf;
-    
-    LPF_Result_t lpf_result_q = LPF_Compute(controller.lpf_current_q, controller.dq_current.q, dt);
-    controller.dq_current.q = lpf_result_q.output;
-    controller.lpf_current_q = lpf_result_q.lpf;
-    
-    // 5. q轴电流PI控制
-    float error_q = iq_ref - controller.dq_current.q;
-    PID_Compute_Result_t pid_result_q = PID_Compute(controller.pid_current_q, error_q, dt);
-    controller.dq_voltage.q = pid_result_q.output;
-    controller.pid_current_q = pid_result_q.pid;  // 更新PID状态
-    
-    // 6. d轴电流PI控制 (id=0策略)
-    float id_ref = controller.target_current_d;  // 通常为0
-    float error_d = id_ref - controller.dq_current.d;
-    PID_Compute_Result_t pid_result_d = PID_Compute(controller.pid_current_d, error_d, dt);
-    controller.dq_voltage.d = pid_result_d.output;
-    controller.pid_current_d = pid_result_d.pid;  // 更新PID状态
-    
-    // 7. 前馈补偿 (反电动势补偿)
-    float bemf_voltage = controller.shaft_velocity * controller.pole_pairs * controller.phase_inductance * iq_ref;
-    controller.dq_voltage.d -= bemf_voltage;
-    
-    // 8. 交叉耦合补偿
-    float cross_coupling = controller.shaft_velocity * controller.pole_pairs * controller.phase_inductance * controller.dq_current.d;
-    controller.dq_voltage.q += cross_coupling;
-    
-    // 9. 限制dq电压
-    controller.dq_voltage.d = fmaxf(-VOLTAGE_LIMIT, fminf(VOLTAGE_LIMIT, controller.dq_voltage.d));
-    controller.dq_voltage.q = fmaxf(-VOLTAGE_LIMIT, fminf(VOLTAGE_LIMIT, controller.dq_voltage.q));
-    
-    // 10. 逆Park变换 (dq -> αβ)
-    AlphaBeta_t voltage_ab = Inverse_Park_Transform(controller.dq_voltage, controller.electrical_angle);
-    
-    // 11. SVPWM调制 (带零序注入)
-    controller = SVPWM_Modulation(controller, voltage_ab.alpha, voltage_ab.beta);
-    
-    return controller;
-}
-
-/* ==================== 速度环控制 ==================== */
-
-/**
- * @brief 速度环PI控制
- * @return q轴电流参考值
- * @details 速度单位为RPM
- */
-float Velocity_Loop_Control(FOC_Controller_t controller, float velocity_ref, float dt) {
-    if (!controller.enabled) {
-        return 0.0f;
-    }
-    
-    // 将参考速度从RPM转换为rad/s (用于计算)
-    float velocity_ref_rad_s = velocity_ref * (_2PI / 60.0f);
-    // 将实际速度从RPM转换为rad/s (用于计算)
-    float actual_velocity_rad_s = controller.shaft_velocity * (_2PI / 60.0f);
-    
-    // 速度误差 (在rad/s域计算)
-    float velocity_error = velocity_ref_rad_s - actual_velocity_rad_s;
-    
-    // 速度PI控制
-    PID_Compute_Result_t pid_result = PID_Compute(controller.pid_velocity, velocity_error, dt);
-    float iq_ref = pid_result.output;
-    
-    // 限制q轴电流参考值
-    iq_ref = fmaxf(-CURRENT_LIMIT, fminf(CURRENT_LIMIT, iq_ref));
-    
-    return iq_ref;
-}
-
 /* ==================== IF模式控制 (电流-频率开环) ==================== */
 
 /**
  * @brief IF模式控制 (电流-频率开环)
  * @details 通过控制电流幅值和频率来驱动电机，无需位置传感器
- *          使用反馈电流构成电流闭环，角度开环，速度单位为RPM
+ *          使用反馈电流构成电流闭环，角度开环
  */
 FOC_Controller_t IF_Mode_Control(FOC_Controller_t controller, float current_amplitude, float frequency, float dt) {
     if (!controller.enabled) {
@@ -443,7 +305,6 @@ FOC_Controller_t IF_Mode_Control(FOC_Controller_t controller, float current_ampl
     
     // 计算开环速度 (转换为RPM)
     controller.openloop_velocity = (electrical_velocity / controller.pole_pairs) * 60.0f / (_2PI); // 转换为RPM
-    controller.shaft_velocity = controller.openloop_velocity; // 临时设置，实际应该来自编码器
     
     // 读取反馈电流
     controller = Read_Phase_Currents(controller);
@@ -453,6 +314,15 @@ FOC_Controller_t IF_Mode_Control(FOC_Controller_t controller, float current_ampl
     
     // 执行Park变换 (αβ -> dq)，使用开环电角度
     controller.dq_current = Park_Transform(controller.alpha_beta_current, controller.electrical_angle);
+    
+    // 低通滤波
+    LPF_Result_t lpf_result_d = LPF_Compute(controller.lpf_current_d, controller.dq_current.d, dt);
+    controller.dq_current.d = lpf_result_d.output;
+    controller.lpf_current_d = lpf_result_d.lpf;
+    
+    LPF_Result_t lpf_result_q = LPF_Compute(controller.lpf_current_q, controller.dq_current.q, dt);
+    controller.dq_current.q = lpf_result_q.output;
+    controller.lpf_current_q = lpf_result_q.lpf;
     
     // 使用电流闭环控制
     // 期望的dq轴电流 (IF模式下，通常d轴电流为0，q轴电流为目标值)
@@ -479,117 +349,6 @@ FOC_Controller_t IF_Mode_Control(FOC_Controller_t controller, float current_ampl
     
     // SVPWM调制 (带零序注入)
     controller = SVPWM_Modulation(controller, voltage_ab.alpha, voltage_ab.beta);
-    
-    return controller;
-}
-
-/* ==================== VF模式控制 (电压-频率开环) ==================== */
-
-/**
- * @brief VF模式控制 (电压-频率开环)
- * @param controller FOC控制器结构体
- * @param voltage_amplitude 电压幅值 [V]
- * @param frequency 频率 [Hz]
- * @param dt 时间间隔 [s]
- * @return 更新后的FOC控制器结构体
- * @details 通过控制电压幅值和频率比值来驱动电机，保持磁通恒定
- *          使用开环控制，速度单位为RPM
- */
-FOC_Controller_t VF_Mode_Control(FOC_Controller_t controller, float voltage_amplitude, float frequency, float dt) {
-    if (!controller.enabled) {
-        return controller;
-    }
-    
-    // 限制电压幅值
-    voltage_amplitude = fmaxf(0.0f, fminf(VOLTAGE_LIMIT, voltage_amplitude));
-    
-    // 限制频率
-    float max_freq = VELOCITY_LIMIT / (_2PI * controller.pole_pairs);
-    frequency = fmaxf(0.0f, fminf(max_freq, frequency));
-    
-    // VF比值计算 (保持磁通恒定)
-    // V/f = constant (在基频以下)
-    float base_frequency = 50.0f;  // 基频 [Hz]
-    float base_voltage = VOLTAGE_LIMIT * 0.8f;  // 基压
-    float vf_ratio = base_voltage / base_frequency;
-    
-    // 计算目标电压 (低频时需要电压提升以克服电阻压降)
-    float min_voltage = controller.phase_resistance * CURRENT_LIMIT * 0.2f;  // 最小启动电压
-    float target_voltage = fmaxf(min_voltage, vf_ratio * frequency);
-    target_voltage = fminf(target_voltage, voltage_amplitude);
-    
-    // 累加开环角度
-    float electrical_velocity = _2PI * frequency * controller.pole_pairs;
-    controller.openloop_angle += electrical_velocity * dt;
-    controller.openloop_angle = Normalize_Angle(controller.openloop_angle);
-    
-    // 更新电角度
-    controller.electrical_angle = controller.openloop_angle;
-    
-    // 计算开环速度 (转换为RPM)
-    controller.openloop_velocity = (electrical_velocity / controller.pole_pairs) * 60.0f / (_2PI); // 转换为RPM
-    controller.shaft_velocity = controller.openloop_velocity;
-    
-    // 设置dq轴电压 (纯q轴电压)
-    controller.dq_voltage.d = 0.0f;
-    controller.dq_voltage.q = target_voltage;
-    
-    // 逆Park变换
-    AlphaBeta_t voltage_ab = Inverse_Park_Transform(controller.dq_voltage, controller.electrical_angle);
-    
-    // SVPWM调制
-    controller = SVPWM_Modulation(controller, voltage_ab.alpha, voltage_ab.beta);
-    
-    return controller;
-}
-
-/* ==================== FOC主循环 ==================== */
-
-/**
- * @brief FOC主循环
- * @details 根据当前控制模式执行相应的控制算法
- */
-FOC_Controller_t FOC_Loop(FOC_Controller_t controller, float dt) {
-    if (!controller.enabled || dt <= 0.0f) {
-        return controller;
-    }
-    
-    switch (controller.control_mode) {
-        case FOC_MODE_CURRENT:
-            // 电流环控制
-            controller = Current_Loop_FOC(controller, controller.target_current_q, dt);
-            break;
-            
-        case FOC_MODE_VELOCITY:
-            // 速度环控制 (外环) + 电流环控制 (内环)
-            {
-                float velocity_error = controller.target_velocity - controller.shaft_velocity;
-                PID_Compute_Result_t pid_result_vel = PID_Compute(controller.pid_velocity, velocity_error, dt);
-                controller.pid_velocity = pid_result_vel.pid; // 更新PID状态
-                
-                float iq_ref = pid_result_vel.output;
-                // 限制q轴电流参考值
-                iq_ref = fmaxf(-CURRENT_LIMIT, fminf(CURRENT_LIMIT, iq_ref));
-                
-                controller = Current_Loop_FOC(controller, iq_ref, dt);
-            }
-            break;
-            
-        case FOC_MODE_IF:
-            // IF模式控制
-            controller = IF_Mode_Control(controller, controller.if_current_amplitude, 
-                          controller.target_frequency, dt);
-            break;
-            
-        case FOC_MODE_VF:
-            // VF模式控制
-            controller = VF_Mode_Control(controller, controller.vf_voltage_amplitude, 
-                          controller.target_frequency, dt);
-            break;
-            
-        default:
-            break;
-    }
     
     return controller;
 }
@@ -633,12 +392,12 @@ FOC_Controller_t FOC_Init(uint8_t motor_id) {
     controller.if_current_amplitude = 1.0f;
     controller.vf_voltage_amplitude = 6.0f;
     
-    // 初始化PI控制器 (无微分)
+    // 初始化PI控制器
     // 电流环PI参数 (需要根据实际电机调整)
     controller.pid_current_q = PID_Init(controller.pid_current_q, 3.0f, 300.0f, VOLTAGE_LIMIT);
     controller.pid_current_d = PID_Init(controller.pid_current_d, 3.0f, 300.0f, VOLTAGE_LIMIT);
     
-    // 速度环PI参数 (需要根据实际电机调整)
+    // 速度环PI参数 (不再使用，但仍保留兼容性)
     controller.pid_velocity = PID_Init(controller.pid_velocity, 0.5f, 10.0f, CURRENT_LIMIT);
     
     // 初始化低通滤波器
@@ -651,116 +410,33 @@ FOC_Controller_t FOC_Init(uint8_t motor_id) {
     controller.pwm_b = 0.5f;
     controller.pwm_c = 0.5f;
     
-    // 设置默认控制模式
-    controller.control_mode = FOC_MODE_CURRENT;
+    // 设置默认控制模式为IF模式 (硬编码)
+    controller.control_mode = FOC_MODE_IF;
     
-    // 禁用控制器
-    controller.enabled = false;
+    // 默认启用控制器
+    controller.enabled = true;
     
-    // 存储控制器实例
-    foc_controllers[motor_id] = controller;
+    // 存储全局控制器实例
+    g_foc_controller = controller;
     
     return controller;
 }
 
-/**
- * @brief 设置控制模式
- */
-FOC_Controller_t FOC_SetControlMode(FOC_Controller_t controller, FOC_ControlMode_t mode) {
-    // 切换模式时重置PI控制器
-    if (mode != controller.control_mode) {
-        controller.pid_current_q = PID_Reset(controller.pid_current_q);
-        controller.pid_current_d = PID_Reset(controller.pid_current_d);
-        controller.pid_velocity = PID_Reset(controller.pid_velocity);
-        controller.openloop_angle = 0.0f;
-    }
-    
-    controller.control_mode = mode;
-    return controller;
-}
+/* ==================== 全局控制器访问函数 ==================== */
 
 /**
- * @brief 使能/禁用FOC控制器
+ * @brief 执行IF模式控制
  */
-FOC_Controller_t FOC_Enable(FOC_Controller_t controller, bool enable) {
-    if (enable && !controller.enabled) {
-        // 使能时重置所有状态
-        controller.pid_current_q = PID_Reset(controller.pid_current_q);
-        controller.pid_current_d = PID_Reset(controller.pid_current_d);
-        controller.pid_velocity = PID_Reset(controller.pid_velocity);
-        controller.openloop_angle = 0.0f;
-        controller.electrical_angle = 0.0f;
-        
-        // 设置PWM为50% (电机停止)
-        controller.pwm_a = 0.5f;
-        controller.pwm_b = 0.5f;
-        controller.pwm_c = 0.5f;
-    }
-    
-    controller.enabled = enable;
-    return controller;
-}
-
-/* ==================== 获取控制器实例 ==================== */
-
-/**
- * @brief 获取指定电机ID的控制器实例
- * @return 控制器结构体副本
- */
-FOC_Controller_t FOC_GetController(uint8_t motor_id) {
-    if (motor_id == MOTOR_ID) {
-        return foc_controllers[motor_id];
-    }
-    // 返回空控制器
-    FOC_Controller_t empty_controller;
-    memset(&empty_controller, 0, sizeof(FOC_Controller_t));
-    return empty_controller;
-}
-
-/**
- * @brief 更新控制器实例
- * @param controller 更新后的控制器
- */
-void FOC_UpdateController(FOC_Controller_t controller) {
-    if (controller.motor_id == MOTOR_ID) {
-        foc_controllers[controller.motor_id] = controller;
-    }
-}
-
-/**
- * @brief 设置目标q轴电流
- */
-void FOC_SetTargetCurrentQ(uint8_t controller_id, float current_q) {
-    if (controller_id == MOTOR_ID) {
-        foc_controllers[controller_id].target_current_q = current_q;
-    }
-}
-
-/**
- * @brief 设置目标速度
- */
-void FOC_SetTargetVelocity(uint8_t controller_id, float velocity) {
-    if (controller_id == MOTOR_ID) {
-        foc_controllers[controller_id].target_velocity = velocity;
-    }
+void FOC_Run(void) {
+    g_foc_controller = IF_Mode_Control(g_foc_controller, 
+        g_foc_controller.if_current_amplitude, 
+        g_foc_controller.target_frequency, Ts);
 }
 
 /**
  * @brief 设置IF模式参数
  */
-void FOC_SetIFModeParams(uint8_t controller_id, float current_amplitude, float frequency) {
-    if (controller_id == MOTOR_ID) {
-        foc_controllers[controller_id].if_current_amplitude = current_amplitude;
-        foc_controllers[controller_id].target_frequency = frequency;
-    }
-}
-
-/**
- * @brief 设置VF模式参数
- */
-void FOC_SetVFModeParams(uint8_t controller_id, float voltage_amplitude, float frequency) {
-    if (controller_id == MOTOR_ID) {
-        foc_controllers[controller_id].vf_voltage_amplitude = voltage_amplitude;
-        foc_controllers[controller_id].target_frequency = frequency;
-    }
+void FOC_SetIFModeParams(float current_amplitude, float frequency) {
+    g_foc_controller.if_current_amplitude = current_amplitude;
+    g_foc_controller.target_frequency = frequency;
 }
